@@ -10,13 +10,23 @@
 use std::path::PathBuf;
 
 fn ref_dir() -> Option<PathBuf> {
-    let d = std::env::var("PIVO_REF_DIR").ok()?;
+    let d = match std::env::var("PIVO_REF_DIR") {
+        Ok(d) => d,
+        Err(_) if std::env::var_os("PIVO_REQUIRE_REFERENCE").is_some() => panic!("PIVO_REF_DIR required"),
+        Err(_) => return None,
+    };
     let p = PathBuf::from(d);
     if p.join("tokens.bin").exists() {
         Some(p)
     } else {
+        assert!(std::env::var_os("PIVO_REQUIRE_REFERENCE").is_none(), "reference tokens.bin missing");
         None
     }
+}
+
+
+fn reference_case(rd: &PathBuf) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(rd.join("case.json")).expect("missing case manifest")).expect("invalid case manifest")
 }
 
 fn model_dir() -> PathBuf {
@@ -28,6 +38,7 @@ fn model_dir() -> PathBuf {
 /// Read a little-endian f32 binary file (as dumped by np.tofile).
 fn read_f32_bin(path: &PathBuf) -> Vec<f32> {
     let bytes = std::fs::read(path).expect(&format!("missing {}", path.display()));
+    assert_eq!(bytes.len() % 4, 0, "malformed f32 tensor");
     bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -36,6 +47,7 @@ fn read_f32_bin(path: &PathBuf) -> Vec<f32> {
 
 fn read_i64_bin(path: &PathBuf) -> Vec<i64> {
     let bytes = std::fs::read(path).expect(&format!("missing {}", path.display()));
+    assert_eq!(bytes.len() % 8, 0, "malformed i64 tensor");
     bytes
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes([
@@ -45,6 +57,8 @@ fn read_i64_bin(path: &PathBuf) -> Vec<i64> {
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "reference length mismatch");
+    assert!(a.iter().chain(b.iter()).all(|v| v.is_finite()), "non-finite reference or output");
     a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
 }
 
@@ -60,7 +74,9 @@ fn encoder_matches_reference() {
 
     let model = pivo_runner::model::PivoModel::load_dir(model_dir())
         .expect("failed to load model");
-    let (enc, log_dur) = model.encoder.run(&tokens, 0, tokens.len());
+    let case = reference_case(&rd);
+    let voice_id = model.voice_id(case["voice"].as_str().expect("voice")).expect("unknown voice");
+    let (enc, log_dur) = model.encoder.run(&tokens, voice_id, tokens.len());
 
     let d_enc = max_abs_diff(&enc, &ref_encoded);
     let d_dur = max_abs_diff(&log_dur, &ref_logdur);
@@ -105,13 +121,13 @@ fn end_to_end_audio() {
     let ref_audio = read_f32_bin(&rd.join("audio.bin"));
     let engine = pivo_runner::Engine::load_dir(model_dir()).expect("load failed");
     let opts = pivo_runner::SynthOptions {
-        voice: "Pi".into(),
-        speed: 1.0,
+        voice: reference_case(&rd)["voice"].as_str().expect("voice").into(),
+        speed: reference_case(&rd)["speed"].as_f64().expect("speed") as f32,
         strict: true,
         overrides: Default::default(),
     };
     let audio = engine
-        .synthesize("NASA is ready for the next mission.", &opts)
+        .synthesize(reference_case(&rd)["text"].as_str().expect("text"), &opts)
         .expect("synthesis failed");
     eprintln!("ref {} samples, rust {} samples", ref_audio.len(), audio.len());
     assert_eq!(audio.len(), ref_audio.len(), "sample count mismatch");

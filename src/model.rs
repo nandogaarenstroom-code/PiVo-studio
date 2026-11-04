@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::onnx_loader::{ModelLoadError, ModelMetadata, OnnxGraph};
 use crate::text;
+use crate::cpu::{dot, matvec_into, rms_norm_into, rms_norm_block, apply_rope, conv1d, conv1d_depthwise, silu_in_place, softmax_row, clip_in_place};
 
 const EPS: f32 = 1e-6;
 const NEG_MASK: f32 = -10000.0;
@@ -28,75 +29,12 @@ const PITCH_GAIN_EPS: f32 = 1e-5;
 const PITCH_MEMORY_LEN: usize = 256;
 
 // ---------------------------------------------------------------------------
-// SIMD-friendly f32 kernels (auto-vectorized by LLVM; also work on NEON/WASM)
+// Platform-dispatched numerical primitives live in cpu.rs.
 // ---------------------------------------------------------------------------
-
-#[inline]
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    const N: usize = 8;
-    let mut acc = [0f32; N];
-    let mut i = 0;
-    while i + N <= a.len() {
-        for k in 0..N {
-            acc[k] += a[i + k] * b[i + k];
-        }
-        i += N;
-    }
-    let mut sum = 0f32;
-    for k in 0..N {
-        sum += acc[k];
-    }
-    while i < a.len() {
-        sum += a[i] * b[i];
-        i += 1;
-    }
-    sum
-}
-
-/// y[j] = sum_i w[j][i] * x[i] where `w` is [out_dim, in_dim] row-major.
-fn matvec_into(x: &[f32], w: &[f32], out_dim: usize, in_dim: usize, y: &mut [f32]) {
-    debug_assert_eq!(w.len(), out_dim * in_dim);
-    debug_assert_eq!(x.len(), in_dim);
-    debug_assert_eq!(y.len(), out_dim);
-    for (row, yr) in y.iter_mut().enumerate().take(out_dim) {
-        let wrow = &w[row * in_dim..(row + 1) * in_dim];
-        *yr = dot(wrow, x);
-    }
-}
-
-#[inline]
-fn rms_norm_into(x: &[f32], weight: &[f32], out: &mut [f32]) {
-    debug_assert_eq!(x.len(), weight.len());
-    let mut ss = 0f32;
-    for &v in x {
-        ss += v * v;
-    }
-    let inv = 1.0f32 / (ss / x.len() as f32 + EPS).sqrt();
-    for i in 0..x.len() {
-        out[i] = x[i] * inv * weight[i];
-    }
-}
 
 #[inline]
 fn sigmoid(v: f32) -> f32 {
     1.0 / (1.0 + (-v).exp())
-}
-
-/// In-place RMS norm of `x` over the last-dim channel count, then scale by `weight`.
-fn rms_norm_block(x: &mut [f32], weight: &[f32]) {
-    let dim = weight.len();
-    debug_assert_eq!(x.len() % dim, 0);
-    for row in x.chunks_exact_mut(dim) {
-        let mut ss = 0f32;
-        for &v in row.iter() {
-            ss += v * v;
-        }
-        let inv = 1.0f32 / (ss / dim as f32 + EPS).sqrt();
-        for (v, &w) in row.iter_mut().zip(weight.iter()) {
-            *v = *v * inv * w;
-        }
-    }
 }
 
 /// RoPE freqs: exp(i * -ln(10000) / head_dim * 2) for i = 0..head_dim/2.
@@ -110,27 +48,6 @@ fn rope_freqs(head_dim: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Apply RoPE to a token-major [seq][heads][head_dim] buffer given per-position
-/// cos/sin tables. out = concat(x1*cos - x2*sin, x2*cos + x1*sin).
-fn apply_rope(x: &mut [f32], heads: usize, seq: usize, head_dim: usize, cos: &[f32], sin: &[f32]) {
-    let half = head_dim / 2;
-    debug_assert_eq!(x.len(), seq * heads * head_dim);
-    debug_assert_eq!(cos.len(), seq * half);
-    for t in 0..seq {
-        let c = &cos[t * half..(t + 1) * half];
-        let s = &sin[t * half..(t + 1) * half];
-        for h in 0..heads {
-            let row = &mut x[(t * heads + h) * head_dim..(t * heads + h) * head_dim + head_dim];
-            for i in 0..half {
-                let x1 = row[i];
-                let x2 = row[i + half];
-                row[i] = x1 * c[i] - x2 * s[i];
-                row[i + half] = x2 * c[i] + x1 * s[i];
-            }
-        }
-    }
-}
-
 fn rope_tables(positions: &[i64], freqs: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let mut cos = Vec::with_capacity(positions.len() * freqs.len());
     let mut sin = Vec::with_capacity(positions.len() * freqs.len());
@@ -142,118 +59,6 @@ fn rope_tables(positions: &[i64], freqs: &[f32]) -> (Vec<f32>, Vec<f32>) {
         }
     }
     (cos, sin)
-}
-
-/// 1-D conv over [T, C_in] → [T_out, C_out] with dilation and symmetric padding,
-/// where T_out = T + 2*pad - (k-1)*dilation (ONNX Conv semantics: same-padding
-/// when pad=(k-1)*d/2, "valid" when pad=0).
-/// weight: [C_out, C_in, K] row-major. bias optional [C_out].
-fn conv1d(
-    x: &[f32],
-    t_len: usize,
-    c_in: usize,
-    c_out: usize,
-    k: usize,
-    dilation: usize,
-    pad: usize,
-    w: &[f32],
-    bias: Option<&[f32]>,
-    out: &mut [f32],
-) {
-    debug_assert_eq!(x.len(), t_len * c_in);
-    debug_assert_eq!(w.len(), c_out * c_in * k);
-    let t_out = (t_len + 2 * pad).saturating_sub((k - 1) * dilation);
-    debug_assert_eq!(out.len(), t_out * c_out);
-    for t in 0..t_out {
-        let orow = &mut out[t * c_out..(t + 1) * c_out];
-        match bias {
-            Some(b) => orow.copy_from_slice(b),
-            None => {
-                for v in orow.iter_mut() {
-                    *v = 0.0;
-                }
-            }
-        }
-        for co in 0..c_out {
-            // ONNX Conv weight layout: [C_out, C_in, K]
-            let w_co = &w[co * c_in * k..(co + 1) * c_in * k];
-            let mut acc = orow[co];
-            for kk in 0..k {
-                let src = t as isize + kk as isize * dilation as isize - pad as isize;
-                if src < 0 || src >= t_len as isize {
-                    continue;
-                }
-                let xrow = &x[src as usize * c_in..src as usize * c_in + c_in];
-                for ci in 0..c_in {
-                    acc += w_co[ci * k + kk] * xrow[ci];
-                }
-            }
-            orow[co] = acc;
-        }
-    }
-}
-
-/// Depthwise conv1d: groups = C, weight [C,1,K].
-fn conv1d_depthwise(
-    x: &[f32],
-    t_len: usize,
-    channels: usize,
-    k: usize,
-    dilation: usize,
-    pad: usize,
-    w: &[f32],
-    bias: &[f32],
-    out: &mut [f32],
-) {
-    debug_assert_eq!(x.len(), t_len * channels);
-    debug_assert_eq!(w.len(), channels * k);
-    let t_out = (t_len + 2 * pad).saturating_sub((k - 1) * dilation);
-    debug_assert_eq!(out.len(), t_out * channels);
-    for t in 0..t_out {
-        let orow = &mut out[t * channels..(t + 1) * channels];
-        for c in 0..channels {
-            let mut acc = bias[c];
-            let wc = &w[c * k..(c + 1) * k];
-            for kk in 0..k {
-                let src = t as isize + kk as isize * dilation as isize - pad as isize;
-                if src < 0 || src >= t_len as isize {
-                    continue;
-                }
-                acc += wc[kk] * x[src as usize * channels + c];
-            }
-            orow[c] = acc;
-        }
-    }
-}
-
-fn silu_in_place(x: &mut [f32]) {
-    for v in x.iter_mut() {
-        *v = *v * sigmoid(*v);
-    }
-}
-
-fn softmax_row(row: &mut [f32]) {
-    let mut m = f32::NEG_INFINITY;
-    for &v in row.iter() {
-        if v > m {
-            m = v;
-        }
-    }
-    let mut sum = 0f32;
-    for v in row.iter_mut() {
-        *v = (*v - m).exp();
-        sum += *v;
-    }
-    let inv = 1.0 / sum;
-    for v in row.iter_mut() {
-        *v *= inv;
-    }
-}
-
-fn clip_in_place(x: &mut [f32], lo: f32, hi: f32) {
-    for v in x.iter_mut() {
-        *v = v.clamp(lo, hi);
-    }
 }
 
 // ---------------------------------------------------------------------------

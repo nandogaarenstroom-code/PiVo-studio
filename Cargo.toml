@@ -2,6 +2,7 @@
 name = "pivo-studio"
 version = "1.0.0"
 edition = "2021"
+rust-version = "1.89"
 description = "PiVo Studio: local, streaming text-to-speech for PiVo models: Web Studio GUI, OpenAI-compatible server, CLI and C ABI"
 license-file = "LICENSE"
 authors = ["Leon Lehmann <lehmann@empero.org>", "Empero Research <research@empero.org>"]

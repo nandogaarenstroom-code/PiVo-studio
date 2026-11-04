@@ -16,7 +16,9 @@ def main():
     ap.add_argument("--out", default="/tmp/pivo_ref")
     ap.add_argument("--text", default="NASA is ready for the next mission.")
     ap.add_argument("--voice", default="Pi")
+    ap.add_argument("--speed", type=float, default=1.0)
     args = ap.parse_args()
+    if not np.isfinite(args.speed) or not 0.5 <= args.speed <= 2.0: ap.error("speed must be finite and between 0.5 and 2.0")
 
     sys.path.insert(0, args.model_dir)
     from pivo.text import phonemize, VOICE_IDS
@@ -27,6 +29,8 @@ def main():
     onnx_dir = Path(args.model_dir) / "onnx"
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    import json
+    (out / "case.json").write_text(json.dumps({"text": args.text, "voice": args.voice, "speed": args.speed}))
 
     front = phonemize(args.text)
     tokens = np.array([front.token_ids], dtype=np.int64)
@@ -42,7 +46,7 @@ def main():
     log_dur[0].astype(np.float32).tofile(out / "log_durations.bin")
 
     cfg = __import__("json").loads((onnx_dir / "metadata.json").read_text())["config"]
-    durations = (np.rint(np.expm1(log_dur.clip(0, np.log1p(cfg["max_token_frames"]))) / 1.0)
+    durations = (np.rint(np.expm1(log_dur.clip(0, np.log1p(cfg["max_token_frames"]))) / args.speed)
                  .clip(0, cfg["max_token_frames"]).astype(np.int64))
     durations = np.maximum(durations, (tokens >= 10).astype(np.int64))
     durations[tokens <= 2] = 0

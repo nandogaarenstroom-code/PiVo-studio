@@ -7,6 +7,7 @@
 //! - `#[no_mangle]` C ABI (`pivo_ffi.h`) ready for JNI (Android), Swift (iOS),
 //!   WebAssembly and plain C/C++.
 
+pub mod cpu;
 pub mod ffi;
 pub mod model;
 pub mod onnx_loader;
@@ -94,6 +95,7 @@ impl Engine {
     pub fn load_dir(dir: impl AsRef<std::path::Path>) -> Result<Self, EngineError> {
         // Eagerly parse the CMU lexicon once so the first request's TTFA stays low.
         let _ = text::lexicon();
+        let _ = cpu::backend_name();
         Ok(Self {
             model: Arc::new(PivoModel::load_dir(dir)?),
             manifest_name: None,
@@ -103,6 +105,7 @@ impl Engine {
     /// Load a `.pivomodel` bundle (single-file format; path or in-memory bytes).
     pub fn load_bundle(bundle: &[u8]) -> Result<Self, EngineError> {
         let _ = text::lexicon();
+        let _ = cpu::backend_name();
         let files = unpack_model_bundle(bundle)?;
         // Capture the manifest's display name if present.
         let manifest_name = files

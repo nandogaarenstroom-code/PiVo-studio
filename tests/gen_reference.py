@@ -18,7 +18,7 @@ def main():
     ap.add_argument("--voice", default="Pi")
     ap.add_argument("--speed", type=float, default=1.0)
     args = ap.parse_args()
-    if not np.isfinite(args.speed) or args.speed <= 0: ap.error("speed must be positive and finite")
+    if not np.isfinite(args.speed) or not 0.5 <= args.speed <= 2.0: ap.error("speed must be finite and between 0.5 and 2.0")
 
     sys.path.insert(0, args.model_dir)
     from pivo.text import phonemize, VOICE_IDS

@@ -127,7 +127,7 @@ fn end_to_end_audio() {
         overrides: Default::default(),
     };
     let audio = engine
-        .synthesize(reference_case(&rd)["text"].as_str().expect("text"), &opts)
+        .synthesize_clause(reference_case(&rd)["text"].as_str().expect("text"), &opts)
         .expect("synthesis failed");
     eprintln!("ref {} samples, rust {} samples", ref_audio.len(), audio.len());
     assert_eq!(audio.len(), ref_audio.len(), "sample count mismatch");

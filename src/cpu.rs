@@ -1183,9 +1183,9 @@ pub(super) unsafe fn matvec_into(x: &[f32], w: &[f32], out_dim: usize, in_dim: u
     assert_eq!(y.len(), out_dim);
     assert_eq!(Some(w.len()), out_dim.checked_mul(in_dim));
     if in_dim == 0 { y.fill(0.0); return; }
-    // SAFETY: shape checks bound every load; dispatch checks the ISA.
+    // SAFETY: checked shapes bound full-vector loads and tails; dispatch checks AVX2/FMA.
     unsafe {
-        let mut row = 0;
+        let mut row = 0usize;
         while out_dim - row >= 4 {
             let mut a0_0 = _mm256_setzero_ps();
             let mut a0_1 = _mm256_setzero_ps();
@@ -1195,7 +1195,7 @@ pub(super) unsafe fn matvec_into(x: &[f32], w: &[f32], out_dim: usize, in_dim: u
             let mut a2_1 = _mm256_setzero_ps();
             let mut a3_0 = _mm256_setzero_ps();
             let mut a3_1 = _mm256_setzero_ps();
-            let mut i = 0;
+            let mut i = 0usize;
             while in_dim - i >= 16 {
                 let x0 = _mm256_loadu_ps(x.as_ptr().add(i + 0));
                 let x1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
@@ -1217,33 +1217,28 @@ pub(super) unsafe fn matvec_into(x: &[f32], w: &[f32], out_dim: usize, in_dim: u
                 a3_0 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w.as_ptr().add((row + 3) * in_dim + i)), a3_0);
                 i += 8;
             }
-            let mut lanes = [0.0f32; 8];
-            let mut sum = 0.0f32;
-            _mm256_storeu_ps(lanes.as_mut_ptr(), a0_0);
-            for v in lanes { sum += v; }
-            _mm256_storeu_ps(lanes.as_mut_ptr(), a0_1);
-            for v in lanes { sum += v; }
+            let v = _mm256_add_ps(a0_0, a0_1);
+            let half = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
+            let pairs = _mm_hadd_ps(half, half);
+            let mut sum = _mm_cvtss_f32(_mm_hadd_ps(pairs, pairs));
             for k in i..in_dim { sum += x[k] * w[(row + 0) * in_dim + k]; }
             y[row + 0] = sum;
-            let mut sum = 0.0f32;
-            _mm256_storeu_ps(lanes.as_mut_ptr(), a1_0);
-            for v in lanes { sum += v; }
-            _mm256_storeu_ps(lanes.as_mut_ptr(), a1_1);
-            for v in lanes { sum += v; }
+            let v = _mm256_add_ps(a1_0, a1_1);
+            let half = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
+            let pairs = _mm_hadd_ps(half, half);
+            let mut sum = _mm_cvtss_f32(_mm_hadd_ps(pairs, pairs));
             for k in i..in_dim { sum += x[k] * w[(row + 1) * in_dim + k]; }
             y[row + 1] = sum;
-            let mut sum = 0.0f32;
-            _mm256_storeu_ps(lanes.as_mut_ptr(), a2_0);
-            for v in lanes { sum += v; }
-            _mm256_storeu_ps(lanes.as_mut_ptr(), a2_1);
-            for v in lanes { sum += v; }
+            let v = _mm256_add_ps(a2_0, a2_1);
+            let half = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
+            let pairs = _mm_hadd_ps(half, half);
+            let mut sum = _mm_cvtss_f32(_mm_hadd_ps(pairs, pairs));
             for k in i..in_dim { sum += x[k] * w[(row + 2) * in_dim + k]; }
             y[row + 2] = sum;
-            let mut sum = 0.0f32;
-            _mm256_storeu_ps(lanes.as_mut_ptr(), a3_0);
-            for v in lanes { sum += v; }
-            _mm256_storeu_ps(lanes.as_mut_ptr(), a3_1);
-            for v in lanes { sum += v; }
+            let v = _mm256_add_ps(a3_0, a3_1);
+            let half = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
+            let pairs = _mm_hadd_ps(half, half);
+            let mut sum = _mm_cvtss_f32(_mm_hadd_ps(pairs, pairs));
             for k in i..in_dim { sum += x[k] * w[(row + 3) * in_dim + k]; }
             y[row + 3] = sum;
             row += 4;
